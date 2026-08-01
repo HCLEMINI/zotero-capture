@@ -26,7 +26,7 @@ WSBridge（WS server，ws://127.0.0.1:24731/bridge）  ← 脚本自带 bind_sta
 
 ## 依赖（必须先满足）
 
-1. **改造的 connector 扩展**装在 Edge，加载自 `<connector-build>/build/manifestv3`（含修复 A/B/C：CF 验证页 blocklist 等待 + 抓空重试 + 前台 tab）。
+1. **改造的 connector 扩展**装在 Edge，加载自 `<connector-build>/build/manifestv3\`（含修复 A/B/C：CF 验证页 blocklist 等待 + 抓空重试 + 前台 tab）。
 2. **Zotero 7 桌面**在跑（`curl http://127.0.0.1:23119/connector/ping` 返回 200）。
 3. 全程 `PYTHONUTF8=1`（中文输出防 GBK 崩）。
 4. **单会话**：只开一个 Claude / zcb 脚本用 24731（多开抢端口，bind_state 会报 port_in_use）。
@@ -52,6 +52,53 @@ URL 规则：
 - **知网用落地链接** `https://kns.cnki.net/kcms2/article/abstract?v=...`，**不要** `ss.zhizhen.com/goread?...` 中转链接（translator 不识别）
 - ScienceDirect / ACS / Nature / Springer / MDPI / Wiley 直链 OK（CF 站 connector 修复后会等过验证页）
 
+### 2.5 获取知网落地链接（源是超星 zhizhen / 表格题录 / 第三方时）
+
+外部来源（Excel 题录表、超星发现 `ss.zhizhen.com/detail_...`、维普/万方导出、EndNote 题录）给的"链接"常**不是**知网落地链接，translator 不识别 → 必须先换成 `kns.cnki.net/kcms2/article/abstract?v=...`。**办法：kimi-webbridge 驱动 Edge 在知网按篇名检索，逐篇取结果链接。** 落地链接在结果列表 `a.fz14` 元素的 `href` 里。
+
+Python 直驱 daemon（`127.0.0.1:10086`；Windows 下用 Python 发 JSON 避免 shell 破坏中文）骨架：
+
+```python
+def call(action, args, session="cnki-cap"):
+    body = json.dumps({"action": action, "args": args, "session": session}).encode("utf-8")
+    req = urllib.request.Request("http://127.0.0.1:10086/command", data=body,
+                                 headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req).read().decode("utf-8"))
+def ev(code):
+    v = call("evaluate", {"code": code})["data"]["value"]
+    return json.loads(v) if isinstance(v, str) else v
+def norm(s):
+    return re.sub(r"[^一-龥A-Za-z0-9]", "", re.sub(r"\s+", "", s or "")).lower()
+
+# navigate 预填搜索框并做一次主题检索
+call("navigate", {"url": f"https://kns.cnki.net/kns8/defaultresult/index?kw={quote(title)}"})
+# 读结果、按标题 norm 严格相等匹配拿 href
+lst = ev("(()=>{return JSON.stringify(Array.from(document.querySelectorAll('a.fz14')).slice(0,30).map(a=>({text:a.innerText.replace(/\\s+/g,' ').trim(),href:a.href})))})()")
+hit = next((it for it in lst if norm(it["text"]) == norm(title)), None)
+```
+
+**四个坑（全是实战踩过，别重蹈）**：
+
+1. **默认 `kw=` 是"主题"检索**，按相关性排序，目标论文常排到前 12 之外 → 切到**篇名**字段再搜（篇名精确，几乎必中且排第一）。
+2. **切字段不能只 `el.click()`**：下拉在 `.sort.reopt`，选中值写进隐藏 `#selectfield`（属性 `value`/`korder`/`data-opt`）。CNKI 的 jQuery handler 要 **`mouseenter`+`click` 双事件**才触发，光 `click` 字段不更新。篇名 = `li[data-val='TI']`。验证：`#selectfield.value=='TI'` 且 `.sort.reopt .sort-default` 文本=="篇名"。
+3. **标题含连字符（如"应力-渗流"）篇名精确检索会漏**：用**去连字符/去标点变体**重搜（如"岩体水力压裂应力渗流耦合近场动力学模拟"），知网标题本身保留连字符，norm 相等即可锁定。
+4. **标题匹配用 norm 严格相等**（去空白+标点+小写），别用包含匹配——主题检索的近似结果会误中。norm 相等 = 同一篇。
+
+切篇名一次成（开下拉 + 选 TI + 返回新字段状态）的可复用 JS：
+
+```js
+(()=>{return JSON.stringify((function(){
+  var w=document.querySelector('.sort.reopt'), def=w.querySelector('.sort-default'), list=w.querySelector('.sort-list');
+  if(list) list.style.display='block'; def.click();
+  var ti=w.querySelector(".sort-list li[data-val='TI']");
+  ti.dispatchEvent(new MouseEvent('mouseenter',{bubbles:true})); ti.click();
+  var sf=document.getElementById('selectfield');
+  return {val:sf.value, korder:sf.getAttribute('korder'), label:def.querySelector('span').innerText.trim()};
+})())})()
+```
+
+> 主动在知网检索用 **lib-search** skill；本节仅解决"已有题录表、只需把第三方链接换成知网落地链接喂给 capture"的场景。
+
 ### 3. 核实 check（**必做！success 不可信**）
 ```bash
 PYTHONUTF8=1 python scripts/check.py --minutes 30
@@ -76,6 +123,7 @@ PYTHONUTF8=1 python scripts/cleanup.py --apply              # 软删（需关 Zo
 6. **重复条目**：重抓同篇会建重复，`cleanup.py` 找出（留最早）。垃圾「请稍候」webpage + Snapshot 也用 cleanup 清。
 7. **多会话抢 24731**：bind_state=port_in_use 时脚本 ABORT 并提示——关掉其它 Claude / 脚本再重试，**别去折腾扩展**。
 8. **connector 改动只在 ASCII 副本 `your connector build clone` 改 + build**；中文开发仓 `your connector source repo (zotero-connectors-claude-code fork)` 是 git remote（中文+方括号路径让 build.sh 的 rsync/perl/jq 挂）。
+9. **源链接不是知网时**（超星 `ss.zhizhen.com/detail_...` / Excel 题录表 / 维普万方导出），translator 不识别 → 先按上文「2.5 获取知网落地链接」用 kimi-webbridge 在知网篇名检索换成 `kns.cnki.net` 落地链接。四坑：默认主题检索要切篇名 / 切字段需 `mouseenter`+`click` 双事件 / 含连字符标题用去标点变体 / norm 严格相等匹配（禁包含匹配）。
 
 ## 故障排查
 
